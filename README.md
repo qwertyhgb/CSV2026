@@ -148,7 +148,7 @@ This baseline is developed based on and inspired by the following works:
 > *Lora: Low-rank adaptation of large language models.*  
 > ICLR, 2022, 1(2): 3.
 
-This baseline is built based on the methods in [1], applying a semi-supervised segmentation + classification approach to our task. Echocare[2] is a self-supervised ultrasound foundation model trained on the Swin UNETR[3] architecture. We further fine-tune the encoder of Swin UNETR with LoRA [4] to adapt it to the downstream task.
+This baseline is built based on the methods in [1], applying a semi-supervised segmentation + classification approach to our task. Echocare[2] is a self-supervised ultrasound foundation model trained on the Swin UNETR[3] architecture. We further fine-tune the encoder of Echocare with LoRA [4] to adapt it to our downstream task.
 
 ---
 
