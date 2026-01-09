@@ -4,6 +4,7 @@ import os
 import sys
 from sklearn.metrics import f1_score, confusion_matrix
 import numpy as np
+from copy import deepcopy
 from typing import Tuple
 
 import torch
@@ -31,6 +32,10 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--base_lr", type=float, default=0.0001)
     parser.add_argument("--conf_thresh", type=float, default=0.9)
+    parser.add_argument("--dynamic_conf", type=bool, default=True,
+                        help="enable dynamic confidence threshold scheduling")
+    parser.add_argument("--conf_thresh_start", type=float, default=0.95)
+    parser.add_argument("--conf_thresh_end", type=float, default=0.80)
     parser.add_argument("--seg_num_classes", type=int, default=3)
     parser.add_argument("--cls_num_classes", type=int, default=1)
     parser.add_argument("--resize_target", type=int, default=256)
@@ -46,6 +51,9 @@ def main():
     parser.add_argument("--save_path", type=str, default="./checkpoints")
     parser.add_argument("--gpu", type=str, default="3")
     parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--ema", type=bool, default=True, help="use EMA teacher for pseudo-labels")
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--ema_start_epoch", type=int, default=0)
 
     args = parser.parse_args()
 
@@ -68,6 +76,13 @@ def main():
     
     logger.info("Total params: {:.1f}M".format(count_params(model)))
     model = model.to(device)
+
+    ema_model = None
+    if args.ema:
+        ema_model = deepcopy(model)
+        ema_model.eval()
+        for p in ema_model.parameters():
+            p.requires_grad_(False)
 
     optimizer = Adam(model.parameters(), lr=args.base_lr)
 
@@ -104,17 +119,29 @@ def main():
         previous_best = ckpt.get("previous_best", 0.0)
         previous_best_seg = ckpt.get("previous_best_seg", 0.0)
         previous_best_cls = ckpt.get("previous_best_cls", 0.0)
+        if ema_model is not None and "ema_model" in ckpt:
+            ema_model.load_state_dict(ckpt["ema_model"])
         logger.info(f"************ Resume from {latest_ckpt}, epoch={start_epoch}, best={previous_best:.2f}")
 
     output_dict = validate(args, model, valid_loader, device, logger, writer=writer, epoch=0)
 
 
     for epoch in range(start_epoch, args.train_epochs):
-        logger.info(f"===========> Epoch: {epoch}, LR: {optimizer.param_groups[0]['lr']:.6f}, Previous best: {previous_best:.2f}")
+        if args.dynamic_conf:
+            progress = epoch / max(1, args.train_epochs - 1)
+            conf_thresh = args.conf_thresh_start + (args.conf_thresh_end - args.conf_thresh_start) * progress
+        else:
+            conf_thresh = args.conf_thresh
+
+        logger.info(
+            f"===========> Epoch: {epoch}, LR: {optimizer.param_groups[0]['lr']:.6f}, "
+            f"Conf: {conf_thresh:.3f}, Previous best: {previous_best:.2f}"
+        )
         
         stats = train_one_epoch(
             args=args,
             model=model,
+            ema_model=ema_model,
             optimizer=optimizer,
             loader_l=train_loader_l,
             loader_u=train_loader_u,
@@ -125,7 +152,8 @@ def main():
             logger=logger,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
-            scaler=scaler
+            scaler=scaler,
+            conf_thresh=conf_thresh
         )
 
         writer.add_scalar("Train/Total_Loss", stats["loss"], epoch)
@@ -133,6 +161,7 @@ def main():
         writer.add_scalar("Train/Loss_s", stats["loss_s"], epoch)
         writer.add_scalar("Train/Loss_fp", stats["loss_fp"], epoch)
         writer.add_scalar("Train/Loss_extra_cls", stats["loss_extra_cls"], epoch)
+        writer.add_scalar("Train/Conf_Thresh", stats["conf_thresh"], epoch)
 
         output_dict = validate(args, model, valid_loader, device, logger, writer=writer, epoch=epoch)
 
@@ -165,6 +194,8 @@ def main():
             "epoch": epoch,
             "previous_best": previous_best,
         }
+        if ema_model is not None:
+            ckpt["ema_model"] = ema_model.state_dict()
         torch.save(ckpt, latest_ckpt)
         if is_best:
             torch.save(ckpt, os.path.join(args.save_path, "best.pth"))
@@ -237,9 +268,22 @@ def ensure_cls_shape(y_cls: torch.Tensor) -> torch.Tensor:
 # -------------------------
 # Train / Val
 # -------------------------
+def update_ema(ema_model: nn.Module, model: nn.Module, decay: float):
+    with torch.no_grad():
+        ema_params = dict(ema_model.named_parameters())
+        model_params = dict(model.named_parameters())
+        for name, param in ema_params.items():
+            param.copy_(param * decay + model_params[name].detach() * (1.0 - decay))
+        ema_buffers = dict(ema_model.named_buffers())
+        model_buffers = dict(model.named_buffers())
+        for name, buf in ema_buffers.items():
+            buf.copy_(model_buffers[name])
+
+
 def train_one_epoch(
     args,
     model,
+    ema_model,
     optimizer,
     loader_l,
     loader_u,
@@ -250,7 +294,8 @@ def train_one_epoch(
     logger,
     use_amp,
     amp_dtype,
-    scaler
+    scaler,
+    conf_thresh
 ):
     model.train()
     
@@ -290,14 +335,14 @@ def train_one_epoch(
 
         # 1) pseudo-label from weak-mix
         with torch.no_grad():
-            model.eval()
-            segL_wm, segT_wm, cls_wm = model(uL_wm, uT_wm)
-            segL_wm = segL_wm.detach()
-            segT_wm = segT_wm.detach()
-            cls_wm = cls_wm.detach()
-
+            teacher = ema_model if ema_model is not None else model
+            restore_train = (ema_model is None) and teacher.training
+            teacher.eval()
+            segL_wm, segT_wm, cls_wm = teacher(uL_wm, uT_wm)
             confL_wm, maskL_wm = pseudo_from_logits(segL_wm)
             confT_wm, maskT_wm = pseudo_from_logits(segT_wm)
+            if restore_train:
+                teacher.train()
 
         # 2) CutMix on strong images (each view separately)
         uL_s1 = cutmix_apply_image(uL_s1, uL_s1m, boxL1)
@@ -336,11 +381,15 @@ def train_one_epoch(
             segT_s1, segT_s2 = segT_s_out.chunk(2, dim=0)
 
             # 5) pseudo-label from weak (non-mix)
-            segL_u_w_detach = segL_u_w.detach()
-            segT_u_w_detach = segT_u_w.detach()
-
-            confL_w, maskL_w = pseudo_from_logits(segL_u_w_detach)
-            confT_w, maskT_w = pseudo_from_logits(segT_u_w_detach)
+            with torch.no_grad():
+                teacher = ema_model if ema_model is not None else model
+                restore_train = (ema_model is None) and teacher.training
+                teacher.eval()
+                segL_w, segT_w, _ = teacher(uL_w, uT_w)
+                confL_w, maskL_w = pseudo_from_logits(segL_w)
+                confT_w, maskT_w = pseudo_from_logits(segT_w)
+                if restore_train:
+                    teacher.train()
 
             # CutMix pseudo-labels for strong s1/s2
             maskL_cm1, confL_cm1 = cutmix_apply_pseudo(maskL_w, confL_w, maskL_wm, confL_wm, boxL1)
@@ -362,10 +411,10 @@ def train_one_epoch(
             loss_x_cls = criterion_cls(cls_x, y_cls.float())
 
             # unlabeled strong seg loss (Dice on pseudo) - average across (view,long/trans) and (s1/s2)
-            ignL1 = (confL_cm1 < args.conf_thresh).float()
-            ignL2 = (confL_cm2 < args.conf_thresh).float()
-            ignT1 = (confT_cm1 < args.conf_thresh).float()
-            ignT2 = (confT_cm2 < args.conf_thresh).float()
+            ignL1 = (confL_cm1 < conf_thresh).float()
+            ignL2 = (confL_cm2 < conf_thresh).float()
+            ignT1 = (confT_cm1 < conf_thresh).float()
+            ignT2 = (confT_cm2 < conf_thresh).float()
 
             loss_uL_s = (criterion_seg_dice(segL_s1, maskL_cm1, softmax=True, ignore=ignL1) +
                         criterion_seg_dice(segL_s2, maskL_cm2, softmax=True, ignore=ignL2)) / 2.0
@@ -374,8 +423,8 @@ def train_one_epoch(
             loss_u_s_seg = (loss_uL_s + loss_uT_s) / 2.0
 
             # fp loss on weak (both views)
-            ignLw = (confL_w < args.conf_thresh).float()
-            ignTw = (confT_w < args.conf_thresh).float()
+            ignLw = (confL_w < conf_thresh).float()
+            ignTw = (confT_w < conf_thresh).float()
             loss_fp_L = criterion_seg_dice(segL_u_w_fp, maskL_w, softmax=True, ignore=ignLw)
             loss_fp_T = criterion_seg_dice(segT_u_w_fp, maskT_w, softmax=True, ignore=ignTw)
             loss_u_w_fp_seg = (loss_fp_L + loss_fp_T) / 2.0
@@ -404,6 +453,9 @@ def train_one_epoch(
                 loss.backward()
                 optimizer.step()
 
+            if ema_model is not None and epoch >= args.ema_start_epoch:
+                update_ema(ema_model, model, decay=args.ema_decay)
+
         # poly lr (same as your old code)
         iters = epoch * len(loader_u) + i
         lr = args.base_lr * (1 - iters / total_iters) ** 0.9
@@ -416,7 +468,7 @@ def train_one_epoch(
         total_loss_fp.update(loss_u_w_fp_seg.item())
         total_loss_extra_cls.update(loss_u_s_cls.item())
 
-        mask_ratio = (confL_w >= args.conf_thresh).sum() / confL_w.numel()
+        mask_ratio = (confL_w >= conf_thresh).sum() / confL_w.numel()
         total_mask_ratio.update(mask_ratio.item())
 
         if i % max(1, (len(loader_u) // 8)) == 0:
@@ -437,6 +489,7 @@ def train_one_epoch(
         "loss_fp": total_loss_fp.avg,
         "loss_extra_cls": total_loss_extra_cls.avg,
         "mask_ratio": total_mask_ratio.avg,
+        "conf_thresh": conf_thresh,
     }
 
 @torch.no_grad()

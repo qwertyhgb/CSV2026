@@ -33,7 +33,16 @@ class CSVSemiDataset(Dataset):
         with h5py.File(image_h5_file, 'r') as f:
             long_img = f['long_img'][:]
             trans_img = f['trans_img'][:]
+        long_img = self._normalize_img(long_img)
+        trans_img = self._normalize_img(trans_img)
         return long_img, trans_img
+
+    @staticmethod
+    def _normalize_img(img):
+        img = img.astype(np.float32)
+        if img.max() > 1.5:
+            img = img / 255.0
+        return img
 
     def _read_label(self, label_h5_file):
         with h5py.File(label_h5_file, 'r') as f:
@@ -107,7 +116,11 @@ class CSVSemiDataset(Dataset):
                 x, y = img.shape
                 img = zoom(img, (self.size / x, self.size / y), order=0)
 
-                img = Image.fromarray((img * 255).astype(np.uint8))
+                if img.max() <= 1.5:
+                    img_uint8 = (img * 255.0).clip(0, 255).astype(np.uint8)
+                else:
+                    img_uint8 = np.clip(img, 0, 255).astype(np.uint8)
+                img = Image.fromarray(img_uint8)
                 img_s1, img_s2 = deepcopy(img), deepcopy(img)
                 img_w = torch.from_numpy(np.array(img)).unsqueeze(0).float() / 255.0
 

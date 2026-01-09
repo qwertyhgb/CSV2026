@@ -81,11 +81,21 @@ def predict_and_save(model, device, file_path, long_t, trans_t, long_shape, tran
         cls_prob = torch.sigmoid(cls_logits).cpu().numpy()
         cls_pred = (cls_prob >= 0.5).astype(np.uint8).reshape(-1)
 
+    # map {0,1,2} -> {0,128,255} to match label format
+    mask_map = np.array([0, 128, 255], dtype=np.uint8)
+    predL = mask_map[predL]
+    predT = mask_map[predT]
+
+    if cls_pred.size == 1:
+        cls_out = cls_pred[0]
+    else:
+        cls_out = cls_pred
+
     # save to h5 with same key names as label files: long_mask, trans_mask, cls
     with h5py.File(out_path, "w") as hf:
         hf.create_dataset("long_mask", data=predL, compression="gzip")
         hf.create_dataset("trans_mask", data=predT, compression="gzip")
-        hf.create_dataset("cls", data=cls_pred)
+        hf.create_dataset("cls", data=cls_out)
 
     return out_path
 
