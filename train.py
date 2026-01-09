@@ -18,8 +18,20 @@ from torch.utils.tensorboard import SummaryWriter
 from dataset.csv import CSVSemiDataset 
 from util.utils import AverageMeter, count_params, DiceLoss, compute_nsd
 
-from model.Echocare import Echocare_UniMatch
 from model.unet import UNetTwoView
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    if s in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {v!r}")
 
 
 def main():
@@ -32,7 +44,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--base_lr", type=float, default=0.0001)
     parser.add_argument("--conf_thresh", type=float, default=0.9)
-    parser.add_argument("--dynamic_conf", type=bool, default=True,
+    parser.add_argument("--dynamic_conf", type=str2bool, default=True,
                         help="enable dynamic confidence threshold scheduling")
     parser.add_argument("--conf_thresh_start", type=float, default=0.95)
     parser.add_argument("--conf_thresh_end", type=float, default=0.80)
@@ -41,7 +53,7 @@ def main():
     parser.add_argument("--resize_target", type=int, default=256)
 
     parser.add_argument("--echo_care_ckpt", type=str, default="./pretrain/echocare_encoder.pth")
-    parser.add_argument('--amp', type=bool, default=True, help='enable torch.cuda.amp')
+    parser.add_argument('--amp', type=str2bool, default=True, help='enable torch.cuda.amp')
     parser.add_argument('--amp-dtype', type=str, default='fp16', choices=['fp16', 'bf16'])
 
     # model choice: Echocare (SwinUNETR-based) or UNet
@@ -51,7 +63,7 @@ def main():
     parser.add_argument("--save_path", type=str, default="./checkpoints")
     parser.add_argument("--gpu", type=str, default="3")
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--ema", type=bool, default=True, help="use EMA teacher for pseudo-labels")
+    parser.add_argument("--ema", type=str2bool, default=True, help="use EMA teacher for pseudo-labels")
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--ema_start_epoch", type=int, default=0)
 
@@ -742,6 +754,14 @@ def get_model(args):
       - 'UNet'     -> UNetTwoView(...)
     """
     if args.model == "Echocare":
+        try:
+            from model.Echocare import Echocare_UniMatch
+        except ModuleNotFoundError as e:
+            raise ModuleNotFoundError(
+                "Failed to import Echocare model dependencies. "
+                "Install requirements (monai, etc.) in a supported Python env (recommended: Python 3.10), "
+                "or run with `--model UNet`."
+            ) from e
         model = Echocare_UniMatch(
             in_chns=1,
             seg_class_num=args.seg_num_classes,

@@ -6,8 +6,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from model.Echocare import Echocare_UniMatch
-
 
 class ValH5Dataset:
     """Simple dataset to iterate over val image .h5 files.
@@ -123,6 +121,13 @@ def main():
     ds = ValH5Dataset(images_dir)
 
     # build model (Echocare)
+    try:
+        from model.Echocare import Echocare_UniMatch
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            "Failed to import Echocare model dependencies. "
+            "Install requirements (monai, etc.) in a supported Python env (recommended: Python 3.10)."
+        ) from e
     model = Echocare_UniMatch(in_chns=1, seg_class_num=3, cls_class_num=1, encoder_pth=args.encoder_pth)
     model = model.to(device)
 

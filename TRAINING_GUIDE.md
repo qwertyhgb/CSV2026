@@ -4,6 +4,21 @@
 
 ---
 
+## 重要提示：环境兼容性（Echocare 必读）
+
+- **Echocare 模型依赖 `monai`**（见 `requirements.txt`），推荐使用 **Python 3.10** 创建新环境后再安装依赖。
+- 如果你的 Python 版本过新（例如 3.13），`monai` 可能无法安装，从而导致 `--model Echocare` 无法运行。
+- 如需先跑通流程，`--model UNet` 不依赖 `monai`，可以作为临时替代。
+
+快速自检（建议执行）：
+```bash
+python -c "import sys; print(sys.version)"
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python -c "import monai; print(monai.__version__)"
+```
+
+---
+
 ## 第一步：创建 Python 环境
 
 ```bash
@@ -41,6 +56,11 @@ GPU: NVIDIA GeForce RTX 3090
 ```bash
 pip install -r requirements.txt
 ```
+
+> ⚠️ **注意：**Echocare 需要 `monai` 安装成功；若你先安装了不匹配的 PyTorch/CUDA，请按官方指引先安装 PyTorch，再执行：
+> ```bash
+> pip install -r requirements.txt --no-deps
+> ```
 
 ---
 
@@ -82,6 +102,8 @@ python split_train_valid_fold.py --root ./data --seed 2026 --val_size 50
 - `train_unlabeled.json` - 无标签训练集  
 - `valid.json` - 验证集
 
+> ⚠️ **注意：**这些 JSON 内会写入**绝对路径**。如果你移动了 `data/` 目录或换了机器路径，请重新运行本步骤生成新的 JSON。
+
 ---
 
 ## 第六步：开始训练
@@ -99,13 +121,21 @@ python train.py ^
   --gpu 0 ^
   --train_epochs 100 ^
   --batch_size 8 ^
-  --amp True
+  --amp True ^
+  --ema True ^
+  --ema_decay 0.999 ^
+  --dynamic_conf True ^
+  --conf_thresh_start 0.95 ^
+  --conf_thresh_end 0.80
 ```
 
 > 💡 **参数说明：**
 > - `--batch_size 8`：RTX 3090 可以稳定运行，如显存不足可降到 4
-> - `--amp True`：启用混合精度训练，加速并节省显存
+> - `--amp True/False`：启用/关闭混合精度训练
 > - `--train_epochs 100`：训练 100 轮
+> - `--ema True/False`：使用 EMA teacher 生成伪标签（默认 True）
+> - `--dynamic_conf True/False`：使用动态置信阈值（默认 True）
+> - `--conf_thresh_start/end`：动态阈值范围（从严格到放宽）
 
 ### 备选：轻量级 UNet（如需快速测试）
 
@@ -134,6 +164,14 @@ tensorboard --logdir ./checkpoints/tensorboard
 
 ### 8.1 对验证集推理
 
+> ⚠️ **注意：**仓库默认不包含 `data/val`。请自行准备验证/测试数据，目录结构如下：
+```text
+data/val/
+└── images/
+    ├── xxxx.h5
+    └── ...
+```
+
 ```bash
 python inference.py ^
   --val-dir ./data/val ^
@@ -142,6 +180,10 @@ python inference.py ^
   --resize-target 256 ^
   --gpu 0
 ```
+
+输出默认保存到 `data/val/preds/`，每个 `*_pred.h5` 包含：
+- `long_mask`、`trans_mask`：**0/128/255**（与训练标签一致）
+- `cls`：0/1
 
 ### 8.2 打包提交文件
 
